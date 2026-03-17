@@ -1,4 +1,5 @@
 {
+    "training_stage": "pretrain",
     "vocab_size": 2048,
     "d_emb": 512,
     "d_model": 384,
@@ -23,7 +24,7 @@
     "num_train_examples": 300000,
     "max_operand": 999999,
     "max_math_stories": 500000,
-    "max_tiny_stories": 500000,
+    "max_tiny_stories": 2000000,
     "eval_every": 5,
     "eval_samples": 200
 }

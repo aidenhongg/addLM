@@ -120,6 +120,34 @@ class CoTFormatter:
         return steps
 
 
+# ── Analogy helpers ──────────────────────────────────────────────────────────
+
+
+def _parse_analogy(doc: str) -> tuple[str, str, str, str] | None:
+    """Parse 'A : B = C : D' → (A, B, C, D) or None on failure."""
+    parts = doc.split(" = ", 1)
+    if len(parts) != 2:
+        return None
+    left = parts[0].split(" : ", 1)
+    right = parts[1].split(" : ", 1)
+    if len(left) != 2 or len(right) != 2:
+        return None
+    return left[0].strip(), left[1].strip(), right[0].strip(), right[1].strip()
+
+
+def _iter_analogies(datasets: dict):
+    """Yield (prompt, answer) pairs from the analogy dataset, skipping math rows."""
+    for split in datasets.get("analogies", {}).values():
+        for row in split:
+            if "math" in (row.get("doc", "") + row.get("test", "") + row.get("domain", "")).lower():
+                continue
+            parsed = _parse_analogy(row["doc"])
+            if parsed is None:
+                continue
+            a, b, c, d = parsed
+            yield f"{a} - {b} + {d}\n", c
+
+
 # ── Text collection for tokenizer training ───────────────────────────────────
 
 
@@ -137,6 +165,8 @@ def collect_texts(
     for split in datasets["tiny_stories"].values():
         for row in split:
             texts.append(row["text"])
+    for prompt, answer in _iter_analogies(datasets):
+        texts.append(prompt + answer)
     if len(texts) > max_texts:
         rng = random.Random(seed)
         texts = rng.sample(texts, max_texts)
@@ -158,6 +188,17 @@ def generate_math_equations(
         equations.append((a, b, "+"))
         equations.append((a, b, "-"))
     return equations
+
+
+def _tokenize_full(
+    enc, text: str, max_seq_len: int
+) -> tuple[Tensor, Tensor] | None:
+    """Tokenize full text for standard causal LM (no prompt masking)."""
+    tokens = enc.encode(text)
+    if len(tokens) < 2 or len(tokens) > max_seq_len:
+        return None
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    return tokens[:-1], tokens[1:]
 
 
 def _tokenize_pair(
@@ -191,7 +232,8 @@ class MathCoTDataset(Dataset):
     answer portion.
     """
 
-    def __init__(self, datasets: dict, max_seq_len: int = 512, seed: int = 42, enc=None):
+    def __init__(self, datasets: dict, max_seq_len: int = 512, seed: int = 42, enc=None,
+                 stage: str = "pretrain"):
         if enc is None:
             enc = get_tokenizer()
         rng = random.Random(seed)
@@ -199,23 +241,27 @@ class MathCoTDataset(Dataset):
         self.inputs: list[Tensor] = []
         self.targets: list[Tensor] = []
 
-        for split in datasets["math_stories"].values():
-            for row in split:
-                answer = str(row["answer"])
-                pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", answer, max_seq_len)
-                if pair:
-                    self.inputs.append(pair[0])
-                    self.targets.append(pair[1])
-
-        for split in datasets["tiny_stories"].values():
-            for row in split:
-                text = row["text"]
-                mid = len(text) // 2
-                if mid > 0:
-                    pair = _tokenize_pair(enc, text[:mid], text[mid:], max_seq_len)
+        if stage == "pretrain":
+            for split in datasets["tiny_stories"].values():
+                for row in split:
+                    pair = _tokenize_full(enc, row["text"], max_seq_len)
                     if pair:
                         self.inputs.append(pair[0])
                         self.targets.append(pair[1])
+        else:
+            for split in datasets["math_stories"].values():
+                for row in split:
+                    answer = str(row["answer"])
+                    pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", answer, max_seq_len)
+                    if pair:
+                        self.inputs.append(pair[0])
+                        self.targets.append(pair[1])
+
+            for prompt, answer in _iter_analogies(datasets):
+                pair = _tokenize_pair(enc, prompt, answer, max_seq_len)
+                if pair:
+                    self.inputs.append(pair[0])
+                    self.targets.append(pair[1])
 
         indices = list(range(len(self.inputs)))
         rng.shuffle(indices)

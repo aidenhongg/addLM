@@ -56,7 +56,7 @@ def main() -> None:
     model, enc = train(cfg)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if args.demo:
+    if args.demo and cfg.get("training_stage") == "finetune":
         demo(model, device, n=args.demo, enc=enc)
 
 

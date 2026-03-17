@@ -20,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
 CKPT_DIR = Path("src") / "checkpoints"
+PRETRAIN_DIR = Path("checkpoints") / "tinystories_pretrained"
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -163,26 +164,33 @@ def _save_final(
 
 
 def train(cfg: dict) -> AdditionLM:
+    stage = cfg.get("training_stage", "pretrain")
     torch.manual_seed(cfg["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     _log_config(cfg)
+    log.info("Training stage: %s", stage)
 
     # ── Data ─────────────────────────────────────────────────────────────
     datasets = download_datasets(
         max_math_stories=cfg.get("max_math_stories", 500_000),
         max_tiny_stories=cfg.get("max_tiny_stories", 500_000),
     )
-    num_equations = cfg.get("num_train_examples", 300_000)
     max_operand = cfg.get("max_operand", 999_999)
 
+    num_equations = 0 if stage == "pretrain" else cfg.get("num_train_examples", 300_000)
+
     # ── Tokenizer ────────────────────────────────────────────────────────
-    sample_eqs = generate_math_equations(10_000, max_operand, cfg["seed"])
-    texts = collect_texts(
-        {**datasets, "math_equations": sample_eqs}, max_texts=50_000, seed=cfg["seed"]
-    )
-    enc = build_tokenizer(texts, vocab_size=cfg["vocab_size"])
-    cfg["vocab_size"] = enc.n_vocab
+    if stage == "finetune":
+        enc = get_tokenizer(PRETRAIN_DIR / "vocab.json")
+        cfg["vocab_size"] = enc.n_vocab
+    else:
+        sample_eqs = generate_math_equations(10_000, max_operand, cfg["seed"])
+        texts = collect_texts(
+            {**datasets, "math_equations": sample_eqs}, max_texts=50_000, seed=cfg["seed"]
+        )
+        enc = build_tokenizer(texts, vocab_size=cfg["vocab_size"])
+        cfg["vocab_size"] = enc.n_vocab
     log.info("Tokenizer: %d vocab (WordPiece)", enc.n_vocab)
 
     static_ds = MathCoTDataset(
@@ -190,6 +198,7 @@ def train(cfg: dict) -> AdditionLM:
         max_seq_len=cfg["max_seq_len"],
         seed=cfg["seed"],
         enc=enc,
+        stage=stage,
     )
     val_size = max(1, int(len(static_ds) * cfg["val_split"]))
     static_train, val_ds = random_split(static_ds, [len(static_ds) - val_size, val_size])
@@ -209,6 +218,11 @@ def train(cfg: dict) -> AdditionLM:
         dropout=cfg["dropout"],
         d_emb=cfg["d_emb"],
     ).to(device)
+
+    if stage == "finetune":
+        model.load_state_dict(torch.load(PRETRAIN_DIR / "final.pt", weights_only=True))
+        log.info("Loaded pretrained weights from %s", PRETRAIN_DIR / "final.pt")
+
     _log_model_attrs(model, device)
 
     # ── Optimiser & scheduler ────────────────────────────────────────────
@@ -220,7 +234,10 @@ def train(cfg: dict) -> AdditionLM:
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     # ── Checkpointing & early stopping ───────────────────────────────────
-    run_dir = CKPT_DIR / f"run_{datetime.now():%Y%m%d_%H%M%S}"
+    if stage == "pretrain":
+        run_dir = PRETRAIN_DIR
+    else:
+        run_dir = CKPT_DIR / f"run_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(run_dir / "train.log")
     fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
@@ -236,14 +253,17 @@ def train(cfg: dict) -> AdditionLM:
     epoch = 0
     try:
         for epoch in range(1, cfg["max_epochs"] + 1):
-            eq_ds = EquationDataset(
-                n=num_equations,
-                max_operand=max_operand,
-                seed=cfg["seed"] + epoch,
-                enc=enc,
-                max_seq_len=cfg["max_seq_len"],
-            )
-            train_ds = ConcatDataset([static_train, eq_ds])
+            if num_equations > 0:
+                eq_ds = EquationDataset(
+                    n=num_equations,
+                    max_operand=max_operand,
+                    seed=cfg["seed"] + epoch,
+                    enc=enc,
+                    max_seq_len=cfg["max_seq_len"],
+                )
+                train_ds = ConcatDataset([static_train, eq_ds])
+            else:
+                train_ds = static_train
             train_loader = DataLoader(
                 train_ds, batch_size=cfg["batch_size"], shuffle=True, collate_fn=collate_cot
             )
@@ -279,9 +299,9 @@ def train(cfg: dict) -> AdditionLM:
             val_loss = evaluate_loss(model, val_loader, device)
             lr = scheduler.get_last_lr()[0]
 
-            # Periodic exact-match accuracy on freshly generated problems
+            # Periodic exact-match accuracy (finetune only – meaningless for pretrain)
             acc_str = ""
-            if epoch % eval_every == 0:
+            if stage == "finetune" and epoch % eval_every == 0:
                 acc = evaluate_accuracy(
                     model, eval_samples, max_operand, device, seed=epoch, enc=enc
                 )
