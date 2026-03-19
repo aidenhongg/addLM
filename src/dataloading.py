@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import dataclass
 
 import torch
@@ -135,8 +136,19 @@ def _parse_analogy(doc: str) -> tuple[str, str, str, str] | None:
     return left[0].strip(), left[1].strip(), right[0].strip(), right[1].strip()
 
 
+def _format_analogy_reasoning(a: str, b: str, c: str, d: str) -> tuple[str, str]:
+    """Build (prompt, supervised) for an analogy with symbolic reasoning."""
+    prompt = f"{c} - {a} + {b} is \n"
+    reasoning = (
+        f"C + -A + B\n"
+        f"(C + -A) + B\n"
+        f"({c} + -({a})) + {b}\n"
+    )
+    return prompt, reasoning + f"= {d}"
+
+
 def _iter_analogies(datasets: dict):
-    """Yield (prompt, answer) pairs from the analogy dataset, skipping math rows."""
+    """Yield (prompt, supervised) pairs from the hyperprobe analogy dataset."""
     for split in datasets.get("analogies", {}).values():
         for row in split:
             if "math" in (row.get("doc", "") + row.get("test", "") + row.get("domain", "")).lower():
@@ -145,7 +157,21 @@ def _iter_analogies(datasets: dict):
             if parsed is None:
                 continue
             a, b, c, d = parsed
-            yield f"{a} - {b} + {d}\n", c
+            yield _format_analogy_reasoning(a, b, c, d)
+
+
+# Column names for the corrupted liyannn/sentence_analogy dataset
+_SA_A = "They traveled to Athens"
+_SA_B = "They took a trip to Greece"
+_SA_C = "They traveled to Baghdad"
+_SA_D = "They took a trip to Iraq"
+
+
+def _iter_sentence_analogies(datasets: dict):
+    """Yield (prompt, supervised) pairs from the sentence_analogy dataset."""
+    for split in datasets.get("sentence_analogies", {}).values():
+        for row in split:
+            yield _format_analogy_reasoning(row[_SA_A], row[_SA_B], row[_SA_C], row[_SA_D])
 
 
 # ── Text collection for tokenizer training ───────────────────────────────────
@@ -166,6 +192,8 @@ def collect_texts(
         for row in split:
             texts.append(row["text"])
     for prompt, answer in _iter_analogies(datasets):
+        texts.append(prompt + answer)
+    for prompt, answer in _iter_sentence_analogies(datasets):
         texts.append(prompt + answer)
     if len(texts) > max_texts:
         rng = random.Random(seed)
@@ -188,6 +216,37 @@ def generate_math_equations(
         equations.append((a, b, "+"))
         equations.append((a, b, "-"))
     return equations
+
+
+def _chain_cot_reasoning(eq_str: str) -> str | None:
+    """Parse equation like '2385 + 761 - 1063 = ?' and produce chained CoT."""
+    clean = eq_str.split("=")[0].strip()
+    tokens = re.findall(r'\d+|[+\-]', clean)
+    if len(tokens) < 3:
+        return None
+    try:
+        result = int(tokens[0])
+    except ValueError:
+        return None
+    lines = [clean] if len(tokens) > 3 else []
+    i = 1
+    while i + 1 < len(tokens):
+        op = tokens[i]
+        if op not in ('+', '-'):
+            return None
+        try:
+            num = int(tokens[i + 1])
+        except ValueError:
+            return None
+        if result < 0 or num < 0:
+            return None
+        ex = CoTFormatter.format(result, num, op)
+        lines.append(ex.prompt.strip())
+        lines.append(ex.reasoning.strip())
+        result = int(ex.answer.split("=")[1].strip())
+        lines.append(f"= {result}")
+        i += 2
+    return "\n".join(lines) + "\n"
 
 
 def _tokenize_full(
@@ -221,15 +280,19 @@ def _tokenize_pair(
 
 
 class MathCoTDataset(Dataset):
-    """Tokenised (prompt, answer) pairs from story datasets.
+    """Tokenised (prompt, reasoning+answer) pairs.
 
-    Sources:
-    - ``math_stories``: HF dataset with question fields → prompt / answer pairs
-    - ``tiny_stories``: HF dataset with text → split in half as prompt / answer
+    Pretrain sources:
+    - ``tiny_stories``: causal LM on full text (no prompt masking)
+
+    Finetune sources:
+    - ``math_stories``: story questions → chained digit-level CoT reasoning
+    - ``analogies``: hyperprobe analogies → symbolic decomposition reasoning
+    - ``sentence_analogies``: sentence analogies → symbolic decomposition reasoning
 
     Each item returns ``(input_ids, target_ids)`` where prompt tokens in
     ``target_ids`` are set to ``IGNORE_INDEX`` so the loss only covers the
-    answer portion.
+    supervised portion.
     """
 
     def __init__(self, datasets: dict, max_seq_len: int = 512, seed: int = 42, enc=None,
@@ -251,14 +314,21 @@ class MathCoTDataset(Dataset):
         else:
             for split in datasets["math_stories"].values():
                 for row in split:
-                    answer = str(row["answer"])
-                    pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", answer, max_seq_len)
+                    reasoning = _chain_cot_reasoning(row.get("eq_qs", ""))
+                    supervised = reasoning if reasoning else f"= {row['answer']}"
+                    pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", supervised, max_seq_len)
                     if pair:
                         self.inputs.append(pair[0])
                         self.targets.append(pair[1])
 
-            for prompt, answer in _iter_analogies(datasets):
-                pair = _tokenize_pair(enc, prompt, answer, max_seq_len)
+            for prompt, supervised in _iter_analogies(datasets):
+                pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
+                if pair:
+                    self.inputs.append(pair[0])
+                    self.targets.append(pair[1])
+
+            for prompt, supervised in _iter_sentence_analogies(datasets):
+                pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
                 if pair:
                     self.inputs.append(pair[0])
                     self.targets.append(pair[1])
