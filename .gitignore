@@ -29,10 +29,10 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # Data / model artifacts
-*.pt
 *.pth
 *.bin
 *.onnx
+*.pt
 
 # Logs
 *.log
