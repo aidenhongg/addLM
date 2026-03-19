@@ -160,20 +160,6 @@ def _iter_analogies(datasets: dict):
             yield _format_analogy_reasoning(a, b, c, d)
 
 
-# Column names for the corrupted liyannn/sentence_analogy dataset
-_SA_A = "They traveled to Athens"
-_SA_B = "They took a trip to Greece"
-_SA_C = "They traveled to Baghdad"
-_SA_D = "They took a trip to Iraq"
-
-
-def _iter_sentence_analogies(datasets: dict):
-    """Yield (prompt, supervised) pairs from the sentence_analogy dataset."""
-    for split in datasets.get("sentence_analogies", {}).values():
-        for row in split:
-            yield _format_analogy_reasoning(row[_SA_A], row[_SA_B], row[_SA_C], row[_SA_D])
-
-
 # ── Text collection for tokenizer training ───────────────────────────────────
 
 
@@ -192,8 +178,6 @@ def collect_texts(
         for row in split:
             texts.append(row["text"])
     for prompt, answer in _iter_analogies(datasets):
-        texts.append(prompt + answer)
-    for prompt, answer in _iter_sentence_analogies(datasets):
         texts.append(prompt + answer)
     if len(texts) > max_texts:
         rng = random.Random(seed)
@@ -309,7 +293,6 @@ class MathCoTDataset(Dataset):
     Finetune sources:
     - ``math_stories``: story questions → chained digit-level CoT reasoning
     - ``analogies``: hyperprobe analogies → symbolic decomposition reasoning
-    - ``sentence_analogies``: sentence analogies → symbolic decomposition reasoning
 
     Each item returns ``(input_ids, target_ids)`` where prompt tokens in
     ``target_ids`` are set to ``IGNORE_INDEX`` so the loss only covers the
@@ -353,12 +336,6 @@ class MathCoTDataset(Dataset):
                             self.targets.append(pair[1])
 
             for prompt, supervised in _iter_analogies(datasets):
-                pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
-                if pair:
-                    self.inputs.append(pair[0])
-                    self.targets.append(pair[1])
-
-            for prompt, supervised in _iter_sentence_analogies(datasets):
                 pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
                 if pair:
                     self.inputs.append(pair[0])

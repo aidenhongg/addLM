@@ -1,5 +1,5 @@
 {
-    "training_stage": "pretrain",
+    "training_stage": "finetune",
     "vocab_size": 2048,
     "d_emb": 512,
     "d_model": 384,
