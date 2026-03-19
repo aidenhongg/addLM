@@ -21,8 +21,9 @@
     "seed": 42,
     "checkpoint_dir": "checkpoints",
 
-    "num_train_examples": 300000,
+    "num_train_examples": 500000,
     "max_operand": 999999,
+    "num_story_augments": 3,
     "max_math_stories": 500000,
     "max_tiny_stories": 2000000,
     "eval_every": 5,

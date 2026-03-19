@@ -28,9 +28,6 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
-# PyTorch checkpoints
-checkpoints/
-
 # Data / model artifacts
 *.pt
 *.pth

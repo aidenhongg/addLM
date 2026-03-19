@@ -39,7 +39,7 @@ class WordPieceTokenizer:
         return self._tokenizer.encode(text).ids
 
     def decode(self, token_ids: list[int]) -> str:
-        return self._tokenizer.decode(token_ids)
+        return self._tokenizer.decode(token_ids, skip_special_tokens=False)
 
     def save(self, path: str | Path) -> None:
         self._tokenizer.save(str(path))

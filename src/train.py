@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
 CKPT_DIR = Path("src") / "checkpoints"
-PRETRAIN_DIR = Path("checkpoints") / "tinystories_pretrained"
+PRETRAIN_DIR = CKPT_DIR / "tinystories_pretrained"
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -199,9 +199,19 @@ def train(cfg: dict) -> AdditionLM:
         seed=cfg["seed"],
         enc=enc,
         stage=stage,
+        max_operand=max_operand,
+        n_augments=cfg.get("num_story_augments", 0),
     )
     val_size = max(1, int(len(static_ds) * cfg["val_split"]))
     static_train, val_ds = random_split(static_ds, [len(static_ds) - val_size, val_size])
+
+    if num_equations > 0:
+        eq_val_ds = EquationDataset(
+            n=max(1, int(num_equations * cfg["val_split"])),
+            max_operand=max_operand, seed=cfg["seed"],
+            enc=enc, max_seq_len=cfg["max_seq_len"],
+        )
+        val_ds = ConcatDataset([val_ds, eq_val_ds])
 
     val_loader = DataLoader(
         val_ds, batch_size=cfg["batch_size"], collate_fn=collate_cot
@@ -220,7 +230,7 @@ def train(cfg: dict) -> AdditionLM:
     ).to(device)
 
     if stage == "finetune":
-        model.load_state_dict(torch.load(PRETRAIN_DIR / "final.pt", weights_only=True))
+        model.load_state_dict(torch.load(PRETRAIN_DIR / "final.pt", map_location=device, weights_only=True))
         log.info("Loaded pretrained weights from %s", PRETRAIN_DIR / "final.pt")
 
     _log_model_attrs(model, device)

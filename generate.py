@@ -7,7 +7,7 @@ from pathlib import Path
 from src.model import AdditionLM
 from src.tokenization import get_tokenizer
 
-CKPT_DIR = Path("checkpoints") / "tinystories_pretrained"
+CKPT_DIR = Path("src") / "checkpoints" / "tinystories_pretrained"
 
 # Load config & tokenizer from checkpoint
 with open(CKPT_DIR / "config.json") as f:

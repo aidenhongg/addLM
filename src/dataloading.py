@@ -218,6 +218,27 @@ def generate_math_equations(
     return equations
 
 
+def _augment_addition_story(
+    row: dict, rng: random.Random, max_operand: int,
+) -> dict | None:
+    """Replace numbers in an addition-only math story with new random values."""
+    eq_str = row.get("eq_qs", "")
+    clean = eq_str.split("=")[0].strip()
+    tokens = re.findall(r'\d+|[+\-]', clean)
+    if len(tokens) < 3 or any(t == '-' for t in tokens):
+        return None
+    orig_nums = [t for t in tokens if t != '+']
+    new_nums = [str(rng.randint(0, max_operand)) for _ in orig_nums]
+    story = row["story_1_qs"]
+    for old, new in zip(orig_nums, new_nums):
+        story = re.sub(r'\b' + re.escape(old) + r'\b', new, story, count=1)
+    return {
+        "eq_qs": " + ".join(new_nums) + " = ?",
+        "story_1_qs": story,
+        "answer": sum(int(n) for n in new_nums),
+    }
+
+
 def _chain_cot_reasoning(eq_str: str) -> str | None:
     """Parse equation like '2385 + 761 - 1063 = ?' and produce chained CoT."""
     clean = eq_str.split("=")[0].strip()
@@ -296,7 +317,7 @@ class MathCoTDataset(Dataset):
     """
 
     def __init__(self, datasets: dict, max_seq_len: int = 512, seed: int = 42, enc=None,
-                 stage: str = "pretrain"):
+                 stage: str = "pretrain", max_operand: int = 999_999, n_augments: int = 0):
         if enc is None:
             enc = get_tokenizer()
         rng = random.Random(seed)
@@ -320,6 +341,16 @@ class MathCoTDataset(Dataset):
                     if pair:
                         self.inputs.append(pair[0])
                         self.targets.append(pair[1])
+                    for _ in range(n_augments):
+                        aug = _augment_addition_story(row, rng, max_operand)
+                        if aug is None:
+                            break
+                        aug_reasoning = _chain_cot_reasoning(aug["eq_qs"])
+                        aug_sup = aug_reasoning if aug_reasoning else f"= {aug['answer']}"
+                        pair = _tokenize_pair(enc, aug["story_1_qs"] + "\n", aug_sup, max_seq_len)
+                        if pair:
+                            self.inputs.append(pair[0])
+                            self.targets.append(pair[1])
 
             for prompt, supervised in _iter_analogies(datasets):
                 pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
