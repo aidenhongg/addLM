@@ -174,7 +174,7 @@ def collect_texts(
     for split in datasets["math_stories"].values():
         for row in split:
             texts.append(row["story_1_qs"] + "\n" + str(row["answer"]))
-    for split in datasets["tiny_stories"].values():
+    for split in datasets["stories"].values():
         for row in split:
             texts.append(row["text"])
     for prompt, answer in _iter_analogies(datasets):
@@ -287,10 +287,8 @@ def _tokenize_pair(
 class MathCoTDataset(Dataset):
     """Tokenised (prompt, reasoning+answer) pairs.
 
-    Pretrain sources:
-    - ``tiny_stories``: causal LM on full text (no prompt masking)
-
-    Finetune sources:
+    Sources:
+    - ``stories``: causal LM on full text (no prompt masking)
     - ``math_stories``: story questions → chained digit-level CoT reasoning
     - ``analogies``: hyperprobe analogies → symbolic decomposition reasoning
 
@@ -300,7 +298,7 @@ class MathCoTDataset(Dataset):
     """
 
     def __init__(self, datasets: dict, max_seq_len: int = 512, seed: int = 42, enc=None,
-                 stage: str = "pretrain", max_operand: int = 999_999, n_augments: int = 0):
+                 max_operand: int = 999_999, n_augments: int = 0):
         if enc is None:
             enc = get_tokenizer()
         rng = random.Random(seed)
@@ -308,38 +306,40 @@ class MathCoTDataset(Dataset):
         self.inputs: list[Tensor] = []
         self.targets: list[Tensor] = []
 
-        if stage == "pretrain":
-            for split in datasets["tiny_stories"].values():
-                for row in split:
-                    pair = _tokenize_full(enc, row["text"], max_seq_len)
-                    if pair:
-                        self.inputs.append(pair[0])
-                        self.targets.append(pair[1])
-        else:
-            for split in datasets["math_stories"].values():
-                for row in split:
-                    reasoning = _chain_cot_reasoning(row.get("eq_qs", ""))
-                    supervised = reasoning if reasoning else f"= {row['answer']}"
-                    pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", supervised, max_seq_len)
-                    if pair:
-                        self.inputs.append(pair[0])
-                        self.targets.append(pair[1])
-                    for _ in range(n_augments):
-                        aug = _augment_addition_story(row, rng, max_operand)
-                        if aug is None:
-                            break
-                        aug_reasoning = _chain_cot_reasoning(aug["eq_qs"])
-                        aug_sup = aug_reasoning if aug_reasoning else f"= {aug['answer']}"
-                        pair = _tokenize_pair(enc, aug["story_1_qs"] + "\n", aug_sup, max_seq_len)
-                        if pair:
-                            self.inputs.append(pair[0])
-                            self.targets.append(pair[1])
-
-            for prompt, supervised in _iter_analogies(datasets):
-                pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
+        # Tiny stories – standard causal LM (no prompt masking)
+        for split in datasets["stories"].values():
+            for row in split:
+                pair = _tokenize_full(enc, row["text"], max_seq_len)
                 if pair:
                     self.inputs.append(pair[0])
                     self.targets.append(pair[1])
+
+        # Math stories – CoT reasoning with prompt masking
+        for split in datasets["math_stories"].values():
+            for row in split:
+                reasoning = _chain_cot_reasoning(row.get("eq_qs", ""))
+                supervised = reasoning if reasoning else f"= {row['answer']}"
+                pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", supervised, max_seq_len)
+                if pair:
+                    self.inputs.append(pair[0])
+                    self.targets.append(pair[1])
+                for _ in range(n_augments):
+                    aug = _augment_addition_story(row, rng, max_operand)
+                    if aug is None:
+                        break
+                    aug_reasoning = _chain_cot_reasoning(aug["eq_qs"])
+                    aug_sup = aug_reasoning if aug_reasoning else f"= {aug['answer']}"
+                    pair = _tokenize_pair(enc, aug["story_1_qs"] + "\n", aug_sup, max_seq_len)
+                    if pair:
+                        self.inputs.append(pair[0])
+                        self.targets.append(pair[1])
+
+        # Analogies – symbolic decomposition reasoning
+        for prompt, supervised in _iter_analogies(datasets):
+            pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
+            if pair:
+                self.inputs.append(pair[0])
+                self.targets.append(pair[1])
 
         indices = list(range(len(self.inputs)))
         rng.shuffle(indices)
@@ -370,6 +370,122 @@ class EquationDataset(Dataset):
                 if pair:
                     self.inputs.append(pair[0])
                     self.targets.append(pair[1])
+
+    def __len__(self) -> int:
+        return len(self.inputs)
+
+    def __getitem__(self, idx: int) -> tuple[Tensor, Tensor]:
+        return self.inputs[idx], self.targets[idx]
+
+
+# ── Pool-based data for ladder training ──────────────────────────────────────
+
+Pool = list[tuple[Tensor, Tensor]]
+
+
+def build_pools(
+    datasets: dict, enc, max_seq_len: int, max_operand: int,
+    n_augments: int, seed: int,
+) -> dict[str, Pool]:
+    """Pre-tokenize all data sources into separate pools for ladder sampling."""
+    rng = random.Random(seed)
+    pools: dict[str, Pool] = {"lang": [], "story": [], "analogy": []}
+
+    for split in datasets["stories"].values():
+        for row in split:
+            pair = _tokenize_full(enc, row["text"], max_seq_len)
+            if pair:
+                pools["lang"].append(pair)
+
+    for split in datasets["math_stories"].values():
+        for row in split:
+            reasoning = _chain_cot_reasoning(row.get("eq_qs", ""))
+            supervised = reasoning if reasoning else f"= {row['answer']}"
+            pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", supervised, max_seq_len)
+            if pair:
+                pools["story"].append(pair)
+            for _ in range(n_augments):
+                aug = _augment_addition_story(row, rng, max_operand)
+                if aug is None:
+                    break
+                aug_reasoning = _chain_cot_reasoning(aug["eq_qs"])
+                aug_sup = aug_reasoning if aug_reasoning else f"= {aug['answer']}"
+                pair = _tokenize_pair(enc, aug["story_1_qs"] + "\n", aug_sup, max_seq_len)
+                if pair:
+                    pools["story"].append(pair)
+
+    for prompt, supervised in _iter_analogies(datasets):
+        pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
+        if pair:
+            pools["analogy"].append(pair)
+
+    return pools
+
+
+def _sample_pool(pool: Pool, n: int, rng: random.Random) -> Pool:
+    """Sample *n* items from *pool*, with replacement if n > len(pool)."""
+    if n <= 0 or not pool:
+        return []
+    return rng.sample(pool, n) if n <= len(pool) else rng.choices(pool, k=n)
+
+
+def _generate_equation_pairs(
+    n: int, max_operand: int, seed: int, enc, max_seq_len: int,
+) -> Pool:
+    """Generate *n* fresh tokenized equation pairs from a seeded PRNG."""
+    rng = random.Random(seed)
+    pairs: Pool = []
+    while len(pairs) < n:
+        a = rng.randint(0, max_operand)
+        b = rng.randint(0, max_operand)
+        op = rng.choice(["+", "-"])
+        ex = CoTFormatter.format(a, b, op)
+        pair = _tokenize_pair(enc, ex.prompt, ex.reasoning + ex.answer, max_seq_len)
+        if pair:
+            pairs.append(pair)
+    return pairs
+
+
+def sample_epoch(
+    pools: dict[str, Pool], ratios: dict[str, float], epoch_size: int,
+    epoch_seed: int, enc, max_seq_len: int, max_operand: int,
+) -> "EpochDataset":
+    """Build one epoch's dataset by sampling pools according to *ratios*."""
+    rng = random.Random(epoch_seed)
+    n_lang = int(epoch_size * ratios["lang"])
+    n_eq = int(epoch_size * ratios["eq"])
+    n_story = int(epoch_size * ratios["story"])
+    n_analogy = epoch_size - n_lang - n_eq - n_story
+
+    items: Pool = []
+    items += _sample_pool(pools["lang"], n_lang, rng)
+    items += _sample_pool(pools["story"], n_story, rng)
+    items += _sample_pool(pools["analogy"], n_analogy, rng)
+    items += _generate_equation_pairs(n_eq, max_operand, epoch_seed, enc, max_seq_len)
+    rng.shuffle(items)
+    return EpochDataset(items)
+
+
+def build_val_set(
+    pools: dict[str, Pool], n: int, max_operand: int,
+    seed: int, enc, max_seq_len: int,
+) -> "EpochDataset":
+    """Build a fixed 50/50 (language / equation) validation set."""
+    rng = random.Random(seed)
+    n_lang = n // 2
+    n_eq = n - n_lang
+    items = _sample_pool(pools["lang"], n_lang, rng)
+    items += _generate_equation_pairs(n_eq, max_operand, seed, enc, max_seq_len)
+    rng.shuffle(items)
+    return EpochDataset(items)
+
+
+class EpochDataset(Dataset):
+    """Thin wrapper around a list of tokenized (input, target) pairs."""
+
+    def __init__(self, items: Pool):
+        self.inputs = [x[0] for x in items]
+        self.targets = [x[1] for x in items]
 
     def __len__(self) -> int:
         return len(self.inputs)

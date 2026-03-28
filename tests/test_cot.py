@@ -91,7 +91,7 @@ def _mock_datasets(**overrides):
              "story_2_qs": "X has 10 cats. Y gives 5 cats.",
              "story_3_qs": "Z has 10. Gets 5. How many?", "answer": 15},
         ]},
-        "tiny_stories": {"train": [
+        "stories": {"train": [
             {"text": "Once upon a time there was a little cat who loved to play."},
         ]},
     }

@@ -9,10 +9,10 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, random_split
+from torch.utils.data import DataLoader
 
 from init import download_datasets
-from src.dataloading import EquationDataset, MathCoTDataset, collate_cot, collect_texts, generate_math_equations
+from src.dataloading import build_pools, build_val_set, collate_cot, collect_texts, generate_math_equations, sample_epoch
 from src.model import AdditionLM
 from src.tokenization import build_tokenizer, get_tokenizer
 
@@ -20,7 +20,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger(__name__)
 
 CKPT_DIR = Path("src") / "checkpoints"
-PRETRAIN_DIR = CKPT_DIR / "tinystories_pretrained"
+
+# ── Ladder stages ────────────────────────────────────────────────────────────
+# lang/eq/story/analogy fractions must sum to 1.0; gate=None means final stage.
+
+LADDER = [
+    {"lang": 0.80, "eq": 0.14, "story": 0.04, "analogy": 0.02, "gate": 2.5, "max_epochs": 15},
+    {"lang": 0.60, "eq": 0.22, "story": 0.14, "analogy": 0.04, "gate": 2.2, "max_epochs": 15},
+    {"lang": 0.40, "eq": 0.24, "story": 0.30, "analogy": 0.06, "gate": 1.9, "max_epochs": 15},
+    {"lang": 0.25, "eq": 0.1875, "story": 0.4875, "analogy": 0.075, "gate": 1.7, "max_epochs": 15},
+    {"lang": 0.20, "eq": 0.16, "story": 0.56, "analogy": 0.08, "gate": None, "max_epochs": 30},
+]
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -163,59 +173,43 @@ def _save_final(
     return run_dir
 
 
-def train(cfg: dict) -> AdditionLM:
-    stage = cfg.get("training_stage", "pretrain")
+def train(cfg: dict) -> tuple[AdditionLM, object]:
     torch.manual_seed(cfg["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = cfg["seed"]
 
     _log_config(cfg)
-    log.info("Training stage: %s", stage)
 
     # ── Data ─────────────────────────────────────────────────────────────
     datasets = download_datasets(
         max_math_stories=cfg.get("max_math_stories", 500_000),
-        max_tiny_stories=cfg.get("max_tiny_stories", 500_000),
+        max_stories=cfg.get("max_stories", 500_000),
+        max_analogies=cfg.get("max_analogies", 500_000),
     )
     max_operand = cfg.get("max_operand", 999_999)
-
-    num_equations = 0 if stage == "pretrain" else cfg.get("num_train_examples", 300_000)
+    epoch_size = cfg.get("epoch_size", 100_000)
 
     # ── Tokenizer ────────────────────────────────────────────────────────
-    if stage == "finetune":
-        enc = get_tokenizer(PRETRAIN_DIR / "vocab.json")
-        cfg["vocab_size"] = enc.n_vocab
-    else:
-        sample_eqs = generate_math_equations(10_000, max_operand, cfg["seed"])
-        texts = collect_texts(
-            {**datasets, "math_equations": sample_eqs}, max_texts=50_000, seed=cfg["seed"]
-        )
-        enc = build_tokenizer(texts, vocab_size=cfg["vocab_size"])
-        cfg["vocab_size"] = enc.n_vocab
+    sample_eqs = generate_math_equations(10_000, max_operand, seed)
+    texts = collect_texts(
+        {**datasets, "math_equations": sample_eqs}, max_texts=50_000, seed=seed
+    )
+    enc = build_tokenizer(texts, vocab_size=cfg["vocab_size"])
+    cfg["vocab_size"] = enc.n_vocab
     log.info("Tokenizer: %d vocab (WordPiece)", enc.n_vocab)
 
-    static_ds = MathCoTDataset(
-        datasets=datasets,
-        max_seq_len=cfg["max_seq_len"],
-        seed=cfg["seed"],
-        enc=enc,
-        stage=stage,
-        max_operand=max_operand,
-        n_augments=cfg.get("num_story_augments", 0),
+    # ── Pools & fixed validation ─────────────────────────────────────────
+    pools = build_pools(
+        datasets, enc, cfg["max_seq_len"], max_operand,
+        cfg.get("num_story_augments", 0), seed,
     )
-    val_size = max(1, int(len(static_ds) * cfg["val_split"]))
-    static_train, val_ds = random_split(static_ds, [len(static_ds) - val_size, val_size])
+    log.info("Pools: lang=%d story=%d analogy=%d",
+             len(pools["lang"]), len(pools["story"]), len(pools["analogy"]))
 
-    if num_equations > 0:
-        eq_val_ds = EquationDataset(
-            n=max(1, int(num_equations * cfg["val_split"])),
-            max_operand=max_operand, seed=cfg["seed"],
-            enc=enc, max_seq_len=cfg["max_seq_len"],
-        )
-        val_ds = ConcatDataset([val_ds, eq_val_ds])
-
-    val_loader = DataLoader(
-        val_ds, batch_size=cfg["batch_size"], collate_fn=collate_cot
+    val_ds = build_val_set(
+        pools, cfg.get("val_size", 5000), max_operand, seed, enc, cfg["max_seq_len"]
     )
+    val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], collate_fn=collate_cot)
 
     # ── Model ────────────────────────────────────────────────────────────
     model = AdditionLM(
@@ -228,115 +222,134 @@ def train(cfg: dict) -> AdditionLM:
         dropout=cfg["dropout"],
         d_emb=cfg["d_emb"],
     ).to(device)
-
-    if stage == "finetune":
-        model.load_state_dict(torch.load(PRETRAIN_DIR / "final.pt", map_location=device, weights_only=True))
-        log.info("Loaded pretrained weights from %s", PRETRAIN_DIR / "final.pt")
-
     _log_model_attrs(model, device)
 
-    # ── Optimiser & scheduler ────────────────────────────────────────────
+    # ── Optimizer ────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.param_groups(cfg["weight_decay"]), lr=cfg["lr"]
     )
-    total_steps = math.ceil((len(static_train) + num_equations) / cfg["batch_size"]) * cfg["max_epochs"]
-    scheduler = get_lr_scheduler(optimizer, cfg["warmup_steps"], total_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    # ── Checkpointing & early stopping ───────────────────────────────────
-    if stage == "pretrain":
-        run_dir = PRETRAIN_DIR
-    else:
-        run_dir = CKPT_DIR / f"run_{datetime.now():%Y%m%d_%H%M%S}"
+    # ── Checkpointing ────────────────────────────────────────────────────
+    run_dir = CKPT_DIR / f"run_{datetime.now():%Y%m%d_%H%M%S}"
     run_dir.mkdir(parents=True, exist_ok=True)
     fh = logging.FileHandler(run_dir / "train.log")
     fh.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
     log.addHandler(fh)
-    stopper = EarlyStopping(cfg["patience"], cfg["min_delta"])
 
-    # ── Loop ─────────────────────────────────────────────────────────────
+    # ── Ladder loop ──────────────────────────────────────────────────────
+    ladder = cfg.get("ladder", LADDER)
+    warmup_steps = cfg["warmup_steps"]
+    batch_size = cfg["batch_size"]
     eval_every = cfg.get("eval_every", 5)
     eval_samples = cfg.get("eval_samples", 200)
+    log_every = cfg.get("log_every_n_batches", 50)
 
-    log_every_n_batches = cfg.get("log_every_n_batches", 50)
+    best_val_loss = float("inf")
+    global_epoch = 0
+    scheduler = None
 
-    epoch = 0
     try:
-        for epoch in range(1, cfg["max_epochs"] + 1):
-            if num_equations > 0:
-                eq_ds = EquationDataset(
-                    n=num_equations,
-                    max_operand=max_operand,
-                    seed=cfg["seed"] + epoch,
-                    enc=enc,
-                    max_seq_len=cfg["max_seq_len"],
-                )
-                train_ds = ConcatDataset([static_train, eq_ds])
-            else:
-                train_ds = static_train
-            train_loader = DataLoader(
-                train_ds, batch_size=cfg["batch_size"], shuffle=True, collate_fn=collate_cot
-            )
-
-            model.train()
-            epoch_loss, n = 0.0, 0
-
-            for batch_idx, (x, y) in enumerate(train_loader, 1):
-                x, y = x.to(device), y.to(device)
-
-                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    loss = model.compute_loss(x, y)
-
-                optimizer.zero_grad(set_to_none=True)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-
-                batch_loss = loss.item()
-                epoch_loss += batch_loss * x.size(0)
-                n += x.size(0)
-
-                if batch_idx % log_every_n_batches == 0:
-                    log.info(
-                        "  Epoch %3d | batch %5d | loss %.4f | lr %.2e",
-                        epoch, batch_idx, batch_loss, scheduler.get_last_lr()[0],
-                    )
-
-            train_loss = epoch_loss / n
-            val_loss = evaluate_loss(model, val_loader, device)
-            lr = scheduler.get_last_lr()[0]
-
-            # Periodic exact-match accuracy (finetune only – meaningless for pretrain)
-            acc_str = ""
-            if stage == "finetune" and epoch % eval_every == 0:
-                acc = evaluate_accuracy(
-                    model, eval_samples, max_operand, device, seed=epoch, enc=enc
-                )
-                acc_str = f" | acc {acc:.2%}"
+        for stage_idx, stage in enumerate(ladder):
+            ratios = {k: stage[k] for k in ("lang", "eq", "story", "analogy")}
+            gate = stage.get("gate")
+            stage_max = stage.get("max_epochs", 15)
 
             log.info(
-                "Epoch %3d | train %.4f | val %.4f | lr %.2e%s",
-                epoch, train_loss, val_loss, lr, acc_str,
+                "\u2550\u2550\u2550 Stage %d/%d | lang %.0f%% eq %.0f%% story %.0f%% analogy %.0f%% | gate %s \u2550\u2550\u2550",
+                stage_idx + 1, len(ladder),
+                ratios["lang"] * 100, ratios["eq"] * 100,
+                ratios["story"] * 100, ratios["analogy"] * 100,
+                f"{gate:.1f}" if gate else "none",
             )
 
-            # Checkpoint on best val loss
-            if val_loss <= stopper.best_loss:
-                torch.save(model.state_dict(), run_dir / "best.pt")
+            # Per-stage scheduler (warmup → cosine)
+            steps_per_epoch = math.ceil(epoch_size / batch_size)
+            scheduler = get_lr_scheduler(
+                optimizer, warmup_steps, steps_per_epoch * stage_max
+            )
 
-            if stopper.step(val_loss):
-                log.info("Early stopping at epoch %d", epoch)
-                break
+            stopper = EarlyStopping(cfg["patience"], cfg["min_delta"]) if gate is None else None
+
+            for epoch in range(1, stage_max + 1):
+                global_epoch += 1
+                epoch_seed = seed + global_epoch
+
+                train_ds = sample_epoch(
+                    pools, ratios, epoch_size, epoch_seed,
+                    enc, cfg["max_seq_len"], max_operand,
+                )
+                train_loader = DataLoader(
+                    train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_cot
+                )
+
+                model.train()
+                epoch_loss, n = 0.0, 0
+
+                for batch_idx, (x, y) in enumerate(train_loader, 1):
+                    x, y = x.to(device), y.to(device)
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        loss = model.compute_loss(x, y)
+                    optimizer.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+
+                    batch_loss = loss.item()
+                    epoch_loss += batch_loss * x.size(0)
+                    n += x.size(0)
+
+                    if batch_idx % log_every == 0:
+                        log.info(
+                            "  S%d E%3d | batch %5d | loss %.4f | lr %.2e",
+                            stage_idx + 1, epoch, batch_idx, batch_loss,
+                            scheduler.get_last_lr()[0],
+                        )
+
+                train_loss = epoch_loss / n
+                val_loss = evaluate_loss(model, val_loader, device)
+                lr = scheduler.get_last_lr()[0]
+
+                acc_str = ""
+                if global_epoch % eval_every == 0:
+                    acc = evaluate_accuracy(
+                        model, eval_samples, max_operand, device,
+                        seed=global_epoch, enc=enc,
+                    )
+                    acc_str = f" | acc {acc:.2%}"
+
+                log.info(
+                    "S%d E%3d (G%3d) | train %.4f | val %.4f | lr %.2e%s",
+                    stage_idx + 1, epoch, global_epoch,
+                    train_loss, val_loss, lr, acc_str,
+                )
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    torch.save(model.state_dict(), run_dir / "best.pt")
+
+                if gate is not None and val_loss <= gate:
+                    log.info(
+                        "Gate %.2f reached (val=%.4f) \u2192 stage %d",
+                        gate, val_loss, stage_idx + 2,
+                    )
+                    break
+
+                if stopper and stopper.step(val_loss):
+                    log.info("Early stopping at global epoch %d", global_epoch)
+                    break
+
     except KeyboardInterrupt:
-        log.info("Training interrupted at epoch %d", epoch)
+        log.info("Training interrupted at global epoch %d", global_epoch)
     finally:
         best_pt = run_dir / "best.pt"
         if best_pt.exists():
             model.load_state_dict(torch.load(best_pt, weights_only=True))
-        final_lr = scheduler.get_last_lr()[0] if epoch > 0 else cfg["lr"]
-        _save_final(run_dir, model, cfg, val_loss=stopper.best_loss, epoch=epoch, lr=final_lr, enc=enc)
+        final_lr = scheduler.get_last_lr()[0] if scheduler and global_epoch > 0 else cfg["lr"]
+        _save_final(run_dir, model, cfg, val_loss=best_val_loss, epoch=global_epoch, lr=final_lr, enc=enc)
         log.removeHandler(fh)
         fh.close()
     return model, enc

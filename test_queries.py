@@ -1,4 +1,4 @@
-"""Run 5 test queries against the best.pt pretrained checkpoint."""
+"""Run 5 test queries against the best.pt checkpoint."""
 
 import json
 from pathlib import Path
@@ -8,14 +8,23 @@ import torch
 from src.model import AdditionLM
 from src.tokenization import get_tokenizer
 
-CKPT_DIR = Path("src") / "checkpoints" / "tinystories_pretrained"
+CKPT_DIR = Path("src") / "checkpoints"
+
+
+def _latest_run() -> Path:
+    """Return the most recently created run_* directory."""
+    runs = sorted(CKPT_DIR.glob("run_*"), key=lambda p: p.stat().st_mtime)
+    if not runs:
+        raise FileNotFoundError(f"No run directories found in {CKPT_DIR}")
+    return runs[-1]
 
 
 def load_model(device: torch.device) -> tuple[AdditionLM, object]:
-    with open(CKPT_DIR / "config.json") as f:
+    run_dir = _latest_run()
+    with open(run_dir / "config.json") as f:
         cfg = json.load(f)
 
-    enc = get_tokenizer(CKPT_DIR / "vocab.json")
+    enc = get_tokenizer(run_dir / "vocab.json")
     cfg["vocab_size"] = enc.n_vocab
 
     model = AdditionLM(
@@ -30,7 +39,7 @@ def load_model(device: torch.device) -> tuple[AdditionLM, object]:
     ).to(device)
 
     model.load_state_dict(
-        torch.load(CKPT_DIR / "best.pt", map_location=device, weights_only=True)
+        torch.load(run_dir / "best.pt", map_location=device, weights_only=True)
     )
     model.eval()
     return model, enc

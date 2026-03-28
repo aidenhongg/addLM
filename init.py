@@ -1,9 +1,9 @@
 from datasets import load_dataset
 
 
-def download_datasets(max_math_stories: int = 500_000, max_tiny_stories: int = 500_000):
+def download_datasets(max_math_stories: int = 500_000, max_stories: int = 500_000, max_analogies: int = 500_000):
     math_stories = load_dataset("azminetoushikwasi/math-story-problems")
-    tiny_stories = load_dataset("roneneldan/TinyStories")
+    stories = load_dataset("HuggingFaceTB/cosmopedia", "stories", trust_remote_code=True)
     analogies = load_dataset("saturnMars/hyperprobe-dataset-analogy")
 
     # Cap rows per split
@@ -11,14 +11,18 @@ def download_datasets(max_math_stories: int = 500_000, max_tiny_stories: int = 5
         n = len(math_stories[split])
         if n > max_math_stories:
             math_stories[split] = math_stories[split].select(range(max_math_stories))
-    for split in tiny_stories:
-        n = len(tiny_stories[split])
-        if n > max_tiny_stories:
-            tiny_stories[split] = tiny_stories[split].select(range(max_tiny_stories))
+    for split in stories:
+        n = len(stories[split])
+        if n > max_stories:
+            stories[split] = stories[split].select(range(max_stories))
+    for split in analogies:
+        n = len(analogies[split])
+        if n > max_analogies:
+            analogies[split] = analogies[split].select(range(max_analogies))
 
     return {
         "math_stories": math_stories,
-        "tiny_stories": tiny_stories,
+        "stories": stories,
         "analogies": analogies,
     }
 
