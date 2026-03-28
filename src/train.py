@@ -181,13 +181,19 @@ def train(cfg: dict) -> tuple[AdditionLM, object]:
     _log_config(cfg)
 
     # ── Data ─────────────────────────────────────────────────────────────
-    datasets = download_datasets(
-        max_math_stories=cfg.get("max_math_stories", 500_000),
-        max_stories=cfg.get("max_stories", 500_000),
-        max_analogies=cfg.get("max_analogies", 500_000),
-    )
     max_operand = cfg.get("max_operand", 999_999)
     epoch_size = cfg.get("epoch_size", 100_000)
+    ladder = cfg.get("ladder", LADDER)
+
+    max_lang_ratio = max(s["lang"] for s in ladder)
+    val_lang = cfg.get("val_size", 5000) // 2
+    max_stories = int(max_lang_ratio * epoch_size * 2) + val_lang
+
+    datasets = download_datasets(
+        max_math_stories=cfg.get("max_math_stories", 500_000),
+        max_stories=max_stories,
+        max_analogies=cfg.get("max_analogies", 500_000),
+    )
 
     # ── Tokenizer ────────────────────────────────────────────────────────
     sample_eqs = generate_math_equations(10_000, max_operand, seed)
@@ -199,12 +205,9 @@ def train(cfg: dict) -> tuple[AdditionLM, object]:
     log.info("Tokenizer: %d vocab (WordPiece)", enc.n_vocab)
 
     # ── Pools & fixed validation ─────────────────────────────────────────
-    pools = build_pools(
-        datasets, enc, cfg["max_seq_len"], max_operand,
-        cfg.get("num_story_augments", 0), seed,
-    )
-    log.info("Pools: lang=%d story=%d analogy=%d",
-             len(pools["lang"]), len(pools["story"]), len(pools["analogy"]))
+    pools = build_pools(datasets, enc, cfg["max_seq_len"], seed)
+    log.info("Pools: lang=%d story_rows=%d analogy=%d",
+             len(pools["lang"]), len(pools["story_rows"]), len(pools["analogy"]))
 
     val_ds = build_val_set(
         pools, cfg.get("val_size", 5000), max_operand, seed, enc, cfg["max_seq_len"]
@@ -238,7 +241,6 @@ def train(cfg: dict) -> tuple[AdditionLM, object]:
     log.addHandler(fh)
 
     # ── Ladder loop ──────────────────────────────────────────────────────
-    ladder = cfg.get("ladder", LADDER)
     warmup_steps = cfg["warmup_steps"]
     batch_size = cfg["batch_size"]
     eval_every = cfg.get("eval_every", 5)

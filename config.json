@@ -20,11 +20,8 @@
 
     "epoch_size": 100000,
     "val_size": 5000,
-    "num_story_augments": 3,
     "max_math_stories": 166666,
     "max_analogies": 500000,
-
-    "max_stories": 2000000,
 
     "max_operand": 999999,
     "eval_every": 5,

@@ -384,12 +384,10 @@ Pool = list[tuple[Tensor, Tensor]]
 
 
 def build_pools(
-    datasets: dict, enc, max_seq_len: int, max_operand: int,
-    n_augments: int, seed: int,
-) -> dict[str, Pool]:
-    """Pre-tokenize all data sources into separate pools for ladder sampling."""
-    rng = random.Random(seed)
-    pools: dict[str, Pool] = {"lang": [], "story": [], "analogy": []}
+    datasets: dict, enc, max_seq_len: int, seed: int,
+) -> dict[str, Pool | list[dict]]:
+    """Pre-tokenize lang/analogy pools; store raw math story rows for on-the-fly augmentation."""
+    pools: dict[str, Pool | list[dict]] = {"lang": [], "story_rows": [], "analogy": []}
 
     for split in datasets["stories"].values():
         for row in split:
@@ -399,20 +397,7 @@ def build_pools(
 
     for split in datasets["math_stories"].values():
         for row in split:
-            reasoning = _chain_cot_reasoning(row.get("eq_qs", ""))
-            supervised = reasoning if reasoning else f"= {row['answer']}"
-            pair = _tokenize_pair(enc, row["story_1_qs"] + "\n", supervised, max_seq_len)
-            if pair:
-                pools["story"].append(pair)
-            for _ in range(n_augments):
-                aug = _augment_addition_story(row, rng, max_operand)
-                if aug is None:
-                    break
-                aug_reasoning = _chain_cot_reasoning(aug["eq_qs"])
-                aug_sup = aug_reasoning if aug_reasoning else f"= {aug['answer']}"
-                pair = _tokenize_pair(enc, aug["story_1_qs"] + "\n", aug_sup, max_seq_len)
-                if pair:
-                    pools["story"].append(pair)
+            pools["story_rows"].append(dict(row))
 
     for prompt, supervised in _iter_analogies(datasets):
         pair = _tokenize_pair(enc, prompt, supervised, max_seq_len)
@@ -422,11 +407,22 @@ def build_pools(
     return pools
 
 
-def _sample_pool(pool: Pool, n: int, rng: random.Random) -> Pool:
+def _sample_pool(pool: list, n: int, rng: random.Random) -> list:
     """Sample *n* items from *pool*, with replacement if n > len(pool)."""
     if n <= 0 or not pool:
         return []
     return rng.sample(pool, n) if n <= len(pool) else rng.choices(pool, k=n)
+
+
+def _tokenize_story_row(
+    row: dict, rng: random.Random, max_operand: int, enc, max_seq_len: int,
+) -> tuple[Tensor, Tensor] | None:
+    """Augment a math story row with fresh random numbers (when possible), then tokenize."""
+    aug = _augment_addition_story(row, rng, max_operand)
+    src = aug if aug is not None else row
+    reasoning = _chain_cot_reasoning(src.get("eq_qs", ""))
+    supervised = reasoning if reasoning else f"= {src['answer']}"
+    return _tokenize_pair(enc, src["story_1_qs"] + "\n", supervised, max_seq_len)
 
 
 def _generate_equation_pairs(
@@ -447,10 +443,13 @@ def _generate_equation_pairs(
 
 
 def sample_epoch(
-    pools: dict[str, Pool], ratios: dict[str, float], epoch_size: int,
+    pools: dict, ratios: dict[str, float], epoch_size: int,
     epoch_seed: int, enc, max_seq_len: int, max_operand: int,
 ) -> "EpochDataset":
-    """Build one epoch's dataset by sampling pools according to *ratios*."""
+    """Build one epoch's dataset by sampling pools according to *ratios*.
+
+    Stories are augmented and tokenized on-the-fly so numbers are fresh each epoch.
+    """
     rng = random.Random(epoch_seed)
     n_lang = int(epoch_size * ratios["lang"])
     n_eq = int(epoch_size * ratios["eq"])
@@ -459,9 +458,16 @@ def sample_epoch(
 
     items: Pool = []
     items += _sample_pool(pools["lang"], n_lang, rng)
-    items += _sample_pool(pools["story"], n_story, rng)
     items += _sample_pool(pools["analogy"], n_analogy, rng)
     items += _generate_equation_pairs(n_eq, max_operand, epoch_seed, enc, max_seq_len)
+
+    # Stories: sample raw rows, augment with fresh numbers, tokenize
+    story_rows = _sample_pool(pools["story_rows"], n_story, rng)
+    for row in story_rows:
+        pair = _tokenize_story_row(row, rng, max_operand, enc, max_seq_len)
+        if pair:
+            items.append(pair)
+
     rng.shuffle(items)
     return EpochDataset(items)
 
